@@ -294,7 +294,7 @@ class TransfomerModel(nn.Module):
                     prev_hyp_id, hyp_word_id, cand_new_hyp_score = \
                         prev_hyp_id.item(), hyp_word_id.item(), cand_new_hyp_score.item()
 
-                    new_hyp_sent = torch.cat((hypotheses[i][prev_hyp_id], torch.tensor([hyp_word_id])))
+                    new_hyp_sent = torch.cat((hypotheses[i][prev_hyp_id], torch.tensor([hyp_word_id], device=self.device)))
                     if hyp_word_id == end_symbol:
                         completed_hypotheses[i].append(Hypothesis(
                             value=[self.vocab.tgt.id2word[a.item()] for a in new_hyp_sent[1:-1]],
@@ -307,7 +307,7 @@ class TransfomerModel(nn.Module):
                 # is empty - we have fully processed that example. We use None as a sentinel in this case.
                 # Above, the loops gracefully handle None examples.
                 if len(new_hypotheses_i) > 0:
-                    hypotheses_i = torch.cat(new_hypotheses_i, dim=-1).transpose(0,-1)
+                    hypotheses_i = torch.cat(new_hypotheses_i, dim=-1).transpose(0,-1).to(self.device)
                     hyp_scores_i = torch.tensor(new_hyp_scores_i, dtype=torch.float, device=self.device)
                 else:
                     hypotheses_i, hyp_scores_i = None, None
