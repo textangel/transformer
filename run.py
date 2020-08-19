@@ -33,6 +33,7 @@ Options:
     --d_model=<int>                         model embedding size [default: 128]
     --d_ff=<int>                            transformer feedforward embedding size [default: 1024]
     --h=<int>                               transformer multi-head attention num of heads [default: 4]
+    --beam_size=<int>                       Beam Size for Beam Search [default: 8]
 """
 
 """
@@ -245,7 +246,9 @@ def decode(args: Dict[str, str], max_batch_size=512, mode='greedy'):
             hypotheses_i = [[transformer_model.vocab.tgt.id2word[w] for w in sent] for sent in hypotheses_i]
             hypotheses += hypotheses_i[0].value
         elif mode == 'beam':
-            hypotheses_batch = transformer_model.beam_search_decode(tensor_src_i)
+            q
+            quit(q)beam_size = int(args.get('--beam_size', 8))
+            hypotheses_batch = transformer_model.beam_search_decode(tensor_src_i, beam_size=beam_size)
             hypotheses += [hyp_i[0].value for hyp_i in hypotheses_batch]
         print(f"Decoded batches {i} - {i+bs}: {num_examples - i - bs} more to go!")
     print(hypotheses)

@@ -180,7 +180,7 @@ class TransfomerModel(nn.Module):
     #            by having an array where the index stores the score of the candidate sentence at that index in the hypothesis tensor.
     #
 
-    def beam_search_decode(self, src: torch.Tensor, max_len: int = 45, beam_size: int = 5) -> List[List[Hypothesis]]:
+    def beam_search_decode(self, src: torch.Tensor, max_len: int = 45, beam_size: int = 32) -> List[List[Hypothesis]]:
         """
         An Implementation of Beam Search for the Transformer Model.
         Beam search is performed in a batched manner. Each example in a batch generates `beam_size` hypotheses.
