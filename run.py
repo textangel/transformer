@@ -241,11 +241,12 @@ def decode(args: Dict[str, str], max_batch_size=512, mode='greedy'):
         tensor_src_i = tensor_src[:,i:i+bs]
         if mode == 'greedy':
             hypotheses_i = transformer_model.greedy_decode(tensor_src_i)
+            hypotheses_i = hypotheses_i.cpu().detach().numpy()
+            hypotheses_i = [[transformer_model.vocab.tgt.id2word[w] for w in sent] for sent in hypotheses_i]
+            hypotheses += hypotheses_i[0].value
         elif mode == 'beam':
-            hypotheses_i = transformer_model.beam_search_decode(tensor_src_i)
-        # hypotheses_i = hypotheses_i.cpu().detach().numpy()
-        # hypotheses_i = [[transformer_model.vocab.tgt.id2word[w] for w in sent] for sent in hypotheses_i]
-        hypotheses += hypotheses_i[0].value
+            hypotheses_batch = transformer_model.beam_search_decode(tensor_src_i)
+            hypotheses += [hyp_i[0].value for hyp_i in hypotheses_batch]
         print(f"Decoded batches {i} - {i+bs}: {num_examples - i - bs} more to go!")
     print(hypotheses)
 
