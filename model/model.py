@@ -178,7 +178,7 @@ class TransfomerModel(nn.Module):
         end_symbol = self.vocab.src.word2id['</s>']
 
         "src has shape (batch_size, sent_len)"
-        src = src.transpose(0,1)[0,:]
+        src = src.transpose(0,1)
         "src_mask has shape (batch_size, 1, sent_len)"
         src_mask = (src != self.vocab.src.word2id['<pad>']).unsqueeze(-2) #TODO Untested
         "model_encodings has shape (batch_size, sentence_len, d_model)"
@@ -197,71 +197,90 @@ class TransfomerModel(nn.Module):
         #            by having an array where the index stores the score of the candidate sentence at that index in the hypothesis tensor.
         #
 
-        "List[String] len 1"
-        hypotheses = [['<s>']]
-        completed_hypotheses = []
-        "Tensor (1,)"
-        hyp_scores = torch.zeros(len(hypotheses), dtype = torch.float, device = self.device) # probs are log_probs must be init at 0.
+        "List len batch_sz of shape (cur beam_sz, dec_sent_len), init: List(4 bt)[(1 init_beam_sz, dec_sent_len)]"
+        "hypotheses[i] is shape (cur beam_sz, dec_sent_len)"
+        hypotheses = [copy.deepcopy(torch.full((1,1), start_symbol, dtype=torch.long,
+                                 device=self.device)) for _ in range(batch_size)]
+        "List after init: List 4 bt of List of len max_len_completed, init: List of len 4 bt of []"
+        completed_hypotheses = [copy.deepcopy([]) for _ in range(batch_size)]
+        "List len batch_sz of shape (cur beam_sz), init: List(4 bt)[(1 init_beam_sz)]"
+        "hyp_scores[i] is shape (cur beam_sz)"
+        hyp_scores = [copy.deepcopy(torch.full((1,), 0, dtype=torch.long,
+                                 device=self.device)) for _ in range(batch_size)] # probs are log_probs must be init at 0.
 
-        candidate_probs = candidate_ix = []
-        current_candidate_ix = None
-        "(batch_size,1)"
-        ys = torch.ones(batch_size, beam_size, 1).fill_(start_symbol).type_as(src.data)
-        full_lineage = []
-
-        for i in range(max_len - 1):
-            hyp_num = len(hypotheses)
-            y_tm1 = torch.tensor([self.vocab.tgt.word2id[hyp[-1]] for hyp in hypotheses], dtype=torch.long,
-                                 device=self.device)
-
-            # ys_init = ys[:,0]
-            out = self.model.decode(model_encodings, src_mask, Variable(y_tm1).to(self.device),
+        for iter in range(max_len - 1):
+            if all([len(completed_hypotheses[i]) == beam_size for i in range(batch_size)]): break
+            cur_beam_sizes = []
+            last_tokens = []
+            model_encodings_l = []
+            src_mask_l = []
+            for i in range(batch_size):
+                cur_beam_size, decoded_len = hypotheses[i].shape
+                cur_beam_sizes += [cur_beam_size]
+                last_tokens += [hypotheses[i][:,-1:]]
+                model_encodings_l += [model_encodings[i:i+1]] * cur_beam_size
+                src_mask_l += [src_mask[i:i+1]] * cur_beam_size
+            "shape (sum(4 bt * cur_beam_sz_i), 1 dec_sent_len, 128 d_model)"
+            model_encodings_cur = torch.cat(model_encodings_l, dim=0)
+            src_mask_cur = torch.cat(src_mask_l, dim=0)
+            y_tm1 = torch.cat(last_tokens, dim=0)# hypotheses[:,:,-1:].reshape(batch_size * cur_beam_size, 1)
+            "shape (sum(4 bt * cur_beam_sz_i), 1 dec_sent_len, 128 d_model)"
+            out = self.model.decode(model_encodings_cur, src_mask_cur, Variable(y_tm1).to(self.device),
                                 Variable(subsequent_mask(y_tm1.size(-1)).type_as(src.data)).to(self.device))
-            log_prob = self.model.generator(out[:, -1])
-            "shape (4 bt,5 beam)"
-            live_hyp_num = beam_size - len(completed_hypotheses)
-            contiuating_hyp_scores = (hyp_scores.unsqueeze(1) \
-                                      .expand((hyp_scores.shape[0], log_prob.shape[1])) + log_prob)\
-                                      .view(-1)
-            top_cand_hyp_scores, top_cand_hyp_pos = torch.topk(contiuating_hyp_scores, k=live_hyp_num)
+            "shape (sum(4 bt * cur_beam_sz_i), 1 dec_sent_len, 50002 vocab_sz)"
+            log_prob = self.model.generator(out[:, -1, :]).unsqueeze(1)
+            "shape (sum(4 bt * cur_beam_sz_i), 1 dec_sent_len, 50002 vocab_sz)"
+            _, decoded_len, vocab_sz = log_prob.shape
+            # log_prob = log_prob.reshape(batch_size, cur_beam_size, decoded_len, vocab_sz)
+            "shape List(4 bt)[(cur_beam_sz_i, dec_sent_len, 50002 vocab_sz)]"
+            "log_prob[i] is (cur_beam_sz_i, dec_sent_len, 50002 vocab_sz)"
+            log_prob = torch.split(log_prob, cur_beam_sizes, dim=0)
 
-            prev_hyp_ids = top_cand_hyp_pos // len(self.vocab.tgt)
-            hyp_word_ids = top_cand_hyp_pos % len(self.vocab.tgt)
+            new_hypotheses, new_hyp_scores = [], []
+            for i in range(batch_size):
+                if len(completed_hypotheses[i]) >= beam_size: continue
 
-            new_hypotheses = []
-            live_hyp_ids = []
-            new_hyp_scores = []
+                cur_beam_sz_i, dec_sent_len, vocab_sz = log_prob[i].shape
+                contiuating_hyp_scores_i = (hyp_scores[i].unsqueeze(-1).unsqueeze(-1) \
+                                          .expand((cur_beam_sz_i, 1, vocab_sz)) + log_prob[i])\
+                                          .view(-1)
+                "shape (4 bt,5 beam)"
+                live_hyp_num_i = beam_size - len(completed_hypotheses[i])
+                "shape (4 bt, 5 beam_size). Vals are between 0 and 50002 vocab_sz * 1 dec_sent_len. Note that dec_sent_len may be >1 in some applications"
+                top_cand_hyp_scores, top_cand_hyp_pos = torch.topk(contiuating_hyp_scores_i, k=live_hyp_num_i)
+                "shape (4 bt, 5 beam_size). prev_hyp_ids vals are 0 <= val < beam_size. hyp_word_ids vals are 0 <= val < vocab_len"
+                prev_hyp_ids, hyp_word_ids = top_cand_hyp_pos // len(self.vocab.tgt), top_cand_hyp_pos % len(self.vocab.tgt)
 
-            for prev_hyp_id, hyp_word_id, cand_new_hyp_score in zip(prev_hyp_ids, hyp_word_ids, top_cand_hyp_scores):
-                prev_hyp_id = prev_hyp_id.item()
-                hyp_word_id = hyp_word_id.item()
-                cand_new_hyp_score = cand_new_hyp_score.item()
+                new_hypotheses_i, new_hyp_scores_i = [],[] # Removed live_hyp_ids_i, which is used in the LSTM decoder to track live hypothesis ids
+                for prev_hyp_id, hyp_word_id, cand_new_hyp_score in zip(prev_hyp_ids, hyp_word_ids, top_cand_hyp_scores):
+                    prev_hyp_id, hyp_word_id, cand_new_hyp_score = \
+                        prev_hyp_id.item(), hyp_word_id.item(), cand_new_hyp_score.item()
 
-                hyp_word = self.vocab.tgt.id2word[hyp_word_id]
-                new_hyp_sent = hypotheses[prev_hyp_id] + [hyp_word]
-                if hyp_word == '</s>':
-                    completed_hypotheses.append(Hypothesis(value=new_hyp_sent[1:-1],
-                                                           score=cand_new_hyp_score))
-                else:
-                    new_hypotheses.append(new_hyp_sent)
-                    live_hyp_ids.append(prev_hyp_id)
-                    new_hyp_scores.append(cand_new_hyp_score)
+                    new_hyp_sent = torch.cat((hypotheses[i][prev_hyp_id], torch.tensor([hyp_word_id])))
+                    if hyp_word_id == end_symbol:
+                        completed_hypotheses[i].append(Hypothesis(
+                            value=[self.vocab.tgt.id2word[a.item()] for a in new_hyp_sent[1:-1]],
+                            score=cand_new_hyp_score))
+                    else:
+                        new_hypotheses_i.append(new_hyp_sent.unsqueeze(-1))
+                        new_hyp_scores_i.append(cand_new_hyp_score)
 
-            if len(completed_hypotheses) == beam_size:
-                break
+                hypotheses_i = torch.cat(new_hypotheses_i, dim=-1).transpose(0,-1)
+                hyp_scores_i = torch.tensor(new_hyp_scores_i, dtype=torch.float, device=self.device)
+                new_hypotheses.append(hypotheses_i)
+                new_hyp_scores.append(hyp_scores_i)
+            print(new_hypotheses, new_hyp_scores)
+            hypotheses, hyp_scores = new_hypotheses, new_hyp_scores
 
-            # live_hyp_ids = torch.tensor(live_hyp_ids, dtype=torch.long, device=self.device)
-            # h_tm1 = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
-            # att
-            hypotheses = new_hypotheses
-            hyp_scores = torch.tensor(new_hyp_scores, dtype=torch.float, device=self.device)
-            print(hypotheses, hyp_scores)
-
-        if len(completed_hypotheses) == 0:
-            completed_hypotheses.append(Hypothesis(value=hypotheses[0][1:],
-                                                   score=hyp_scores[0].item()))
-        completed_hypotheses.sort(key=lambda hyp: hyp.score, reverse=True)
-
+        for i in range(batch_size):
+            hyps_to_add = beam_size - len(completed_hypotheses[i])
+            if hyps_to_add > 0:
+                scores, ix = torch.topk(hyp_scores[i], k=hyps_to_add)
+                for score, id in zip(scores, ix):
+                    completed_hypotheses[i].append(Hypothesis(
+                    value=[self.vocab.tgt.id2word[a.item()] for a in hypotheses[i][id][1:]],
+                    score=score))
+            completed_hypotheses[i].sort(key=lambda hyp: hyp.score, reverse=True)
         print('completed_hypotheses', completed_hypotheses)
         return completed_hypotheses
 
