@@ -168,7 +168,7 @@ class TransfomerModel(nn.Module):
         return ys
 
     # This code predicts a translation using greedy decoding for simplicity.
-    def beam_search_decode(self, src, max_len=30, beam_size = 5):
+    def beam_search_decode(self, src, max_len=45, beam_size = 5):
         """
         :param src: shape (sent_len, batch_size). Each val is 0 < val < len(vocab_dec). The input tokens to the decoder.
         :return:
@@ -215,9 +215,12 @@ class TransfomerModel(nn.Module):
             model_encodings_l = []
             src_mask_l = []
             for i in range(batch_size):
+                if hypotheses[i] is None:
+                    cur_beam_sizes += [0]
+                    continue
                 cur_beam_size, decoded_len = hypotheses[i].shape
                 cur_beam_sizes += [cur_beam_size]
-                last_tokens += [hypotheses[i][:,-1:]]
+                last_tokens += [hypotheses[i]]#[hypotheses[i][:,-1:]]
                 model_encodings_l += [model_encodings[i:i+1]] * cur_beam_size
                 src_mask_l += [src_mask[i:i+1]] * cur_beam_size
             "shape (sum(4 bt * cur_beam_sz_i), 1 dec_sent_len, 128 d_model)"
@@ -238,7 +241,10 @@ class TransfomerModel(nn.Module):
 
             new_hypotheses, new_hyp_scores = [], []
             for i in range(batch_size):
-                if len(completed_hypotheses[i]) >= beam_size: continue
+                if hypotheses[i] is None or len(completed_hypotheses[i]) >= beam_size:
+                    new_hypotheses += [None]
+                    new_hyp_scores += [None]
+                    continue
 
                 cur_beam_sz_i, dec_sent_len, vocab_sz = log_prob[i].shape
                 contiuating_hyp_scores_i = (hyp_scores[i].unsqueeze(-1).unsqueeze(-1) \
@@ -265,10 +271,14 @@ class TransfomerModel(nn.Module):
                         new_hypotheses_i.append(new_hyp_sent.unsqueeze(-1))
                         new_hyp_scores_i.append(cand_new_hyp_score)
 
-                hypotheses_i = torch.cat(new_hypotheses_i, dim=-1).transpose(0,-1)
-                hyp_scores_i = torch.tensor(new_hyp_scores_i, dtype=torch.float, device=self.device)
-                new_hypotheses.append(hypotheses_i)
-                new_hyp_scores.append(hyp_scores_i)
+                if len(new_hypotheses_i) > 0:
+                    hypotheses_i = torch.cat(new_hypotheses_i, dim=-1).transpose(0,-1)
+                    hyp_scores_i = torch.tensor(new_hyp_scores_i, dtype=torch.float, device=self.device)
+                else:
+                    hypotheses_i = None
+                    hyp_scores_i = None
+                new_hypotheses += [hypotheses_i]
+                new_hyp_scores += [hyp_scores_i]
             print(new_hypotheses, new_hyp_scores)
             hypotheses, hyp_scores = new_hypotheses, new_hyp_scores
 
