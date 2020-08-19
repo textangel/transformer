@@ -167,16 +167,41 @@ class TransfomerModel(nn.Module):
             ys = torch.cat([ys, next_word.unsqueeze(1).type_as(src.data)], dim=1)
         return ys
 
-    # This code predicts a translation using greedy decoding for simplicity.
-    def beam_search_decode(self, src, max_len=45, beam_size = 5):
+    # Implement Batch Beam Search As Follows:
+    #     For a Batch of Data
+    #     - keep track of all live hypotheses in a batch ("the hypothesis tensor"). So if batch size is 4, and we keep track of beam size = 5
+    #            We will keep track of 20 hypotheses at once. When generating new hypotheses, we generate top 5 from our 20
+    #            (now the tensor has height 100), and then, for each of the 4 separate sentences,
+    #            whittle the 25 corresponding entries back to 5.
+    #     - We can store all the live entries simply as a large tensor. Alternately we can have a separate tensor for each
+    #           sentence in the target, but this seems very suboptimal. Just keep a tensor of length batch_size * beam_size,
+    #           and instead of taking the max value, take the topk values every step, and make sure to whittle back down to beam_size per target.
+    #     - Have a map (index?) that tracks of the scores corresponding to the live entries for each target. Could also do this very simply
+    #            by having an array where the index stores the score of the candidate sentence at that index in the hypothesis tensor.
+    #
+
+    def beam_search_decode(self, src: torch.Tensor, max_len: int = 45, beam_size: int = 5) -> List[List[Hypothesis]]:
         """
+        An Implementation of Beam Search for the Transformer Model.
+        Beam search is performed in a batched manner. Each example in a batch generates `beam_size` hypotheses.
+        We return a list (len: batch_size) of list (len: beam_size) of Hypothesis, which contain our output decoded sentences
+        and their scores.
+
         :param src: shape (sent_len, batch_size). Each val is 0 < val < len(vocab_dec). The input tokens to the decoder.
-        :return:
+        :param max_len: the maximum length to decode
+        :param beam_size: the beam size to use
+        :return completed_hypotheses: A List of length batch_size, each containing a List of beam_size Hypothesis objects.
+            Hypothesis is a named Tuple, its first entry is "value" and is a List of strings which contains the translated word
+            (one string is one word token). The second entry is "score" and it is the log-prob score for this translated sentence.
+
+        Note: Below I note "4 bt", "5 beam_size" as the shapes of objects. 4, 5 are default values. Actual values may differ.
         """
+        # 1. Setup
         batch_size = src.shape[1]
         start_symbol = self.vocab.src.word2id['<s>']
         end_symbol = self.vocab.src.word2id['</s>']
 
+        # 1.1 Setup Src
         "src has shape (batch_size, sent_len)"
         src = src.transpose(0,1)
         "src_mask has shape (batch_size, 1, sent_len)"
@@ -184,20 +209,8 @@ class TransfomerModel(nn.Module):
         "model_encodings has shape (batch_size, sentence_len, d_model)"
         model_encodings = self.model.encode(src, src_mask)
 
-        # Implement Batch Beam Search As Follows:
-        #     For a Batch of Data
-        #     - keep track of all live hypotheses in a batch ("the hypothesis tensor"). So if batch size is 4, and we keep track of beam size = 5
-        #            We will keep track of 20 hypotheses at once. When generating new hypotheses, we generate top 5 from our 20
-        #            (now the tensor has height 100), and then, for each of the 4 separate sentences,
-        #            whittle the 25 corresponding entries back to 5.
-        #     - We can store all the live entries simply as a large tensor. Alternately we can have a separate tensor for each
-        #           sentence in the target, but this seems very suboptimal. Just keep a tensor of length batch_size * beam_size,
-        #           and instead of taking the max value, take the topk values every step, and make sure to whittle back down to beam_size per target.
-        #     - Have a map (index?) that tracks of the scores corresponding to the live entries for each target. Could also do this very simply
-        #            by having an array where the index stores the score of the candidate sentence at that index in the hypothesis tensor.
-        #
-
-        "List len batch_sz of shape (cur beam_sz, dec_sent_len), init: List(4 bt)[(1 init_beam_sz, dec_sent_len)]"
+        # 1.2 Setup Tgt Hypothesis Tracking
+        "hypothesis is List(4 bt)[(cur beam_sz, dec_sent_len)], init: List(4 bt)[(1 init_beam_sz, dec_sent_len)]"
         "hypotheses[i] is shape (cur beam_sz, dec_sent_len)"
         hypotheses = [copy.deepcopy(torch.full((1,1), start_symbol, dtype=torch.long,
                                  device=self.device)) for _ in range(batch_size)]
@@ -208,25 +221,30 @@ class TransfomerModel(nn.Module):
         hyp_scores = [copy.deepcopy(torch.full((1,), 0, dtype=torch.long,
                                  device=self.device)) for _ in range(batch_size)] # probs are log_probs must be init at 0.
 
+        # 2. Iterate: Generate one char at a time until maxlen
         for iter in range(max_len - 1):
             if all([len(completed_hypotheses[i]) == beam_size for i in range(batch_size)]): break
-            cur_beam_sizes = []
-            last_tokens = []
-            model_encodings_l = []
-            src_mask_l = []
+
+            # 2.1 Setup the batch. Since we use beam search, each batch has a variable number (called cur_beam_size)
+            # between 0 and beam_size of hypotheses live at any moment. We decode all hypotheses for all batches at
+            # the same time, so we must copy the src_encodings, src_mask, etc the appropriate number fo times for
+            # the number of hypotheses for each example. We keep track of the number of live hypotheses for each example.
+            # We run all hypotheses for all examples together through the decoder and log-softmax,
+            # and then use `torch.split` to get the appropriate number of hypotheses for each example in the end.
+            cur_beam_sizes, last_tokens, model_encodings_l, src_mask_l = [], [], [], []
             for i in range(batch_size):
                 if hypotheses[i] is None:
                     cur_beam_sizes += [0]
                     continue
                 cur_beam_size, decoded_len = hypotheses[i].shape
                 cur_beam_sizes += [cur_beam_size]
-                last_tokens += [hypotheses[i]]#[hypotheses[i][:,-1:]]
+                last_tokens += [hypotheses[i]]
                 model_encodings_l += [model_encodings[i:i+1]] * cur_beam_size
                 src_mask_l += [src_mask[i:i+1]] * cur_beam_size
             "shape (sum(4 bt * cur_beam_sz_i), 1 dec_sent_len, 128 d_model)"
             model_encodings_cur = torch.cat(model_encodings_l, dim=0)
             src_mask_cur = torch.cat(src_mask_l, dim=0)
-            y_tm1 = torch.cat(last_tokens, dim=0)# hypotheses[:,:,-1:].reshape(batch_size * cur_beam_size, 1)
+            y_tm1 = torch.cat(last_tokens, dim=0)
             "shape (sum(4 bt * cur_beam_sz_i), 1 dec_sent_len, 128 d_model)"
             out = self.model.decode(model_encodings_cur, src_mask_cur, Variable(y_tm1).to(self.device),
                                 Variable(subsequent_mask(y_tm1.size(-1)).type_as(src.data)).to(self.device))
@@ -239,6 +257,8 @@ class TransfomerModel(nn.Module):
             "log_prob[i] is (cur_beam_sz_i, dec_sent_len, 50002 vocab_sz)"
             log_prob = torch.split(log_prob, cur_beam_sizes, dim=0)
 
+            # 2.2 Now we process each example in the batch. Note that the example may have already finished processing before
+            # other examples (no more hypotheses to try), in which case we continue
             new_hypotheses, new_hyp_scores = [], []
             for i in range(batch_size):
                 if hypotheses[i] is None or len(completed_hypotheses[i]) >= beam_size:
@@ -246,17 +266,29 @@ class TransfomerModel(nn.Module):
                     new_hyp_scores += [None]
                     continue
 
+                # 2.2.1 We compute the cumulative scores for each live hypotheses for the example
+                # hyp_scores is the old scores for the previous stage, and `log_prob` are the new probs for
+                # this stage. Since they are log probs, we sum them instaed of multiplying them.
+                # The .view(-1) forces all the hypotheses into one dimension. The shape of this dimension is
+                # cur_beam_sz * vocab_sz (ex: 5 * 50002). So after getting the topk from it, we can recover the
+                # generating sentence and the next word using: ix // vocab_sz, ix % vocab_sz.
                 cur_beam_sz_i, dec_sent_len, vocab_sz = log_prob[i].shape
-                contiuating_hyp_scores_i = (hyp_scores[i].unsqueeze(-1).unsqueeze(-1) \
+                "shape (vocab_sz,)"
+                cumulative_hyp_scores_i = (hyp_scores[i].unsqueeze(-1).unsqueeze(-1) \
                                           .expand((cur_beam_sz_i, 1, vocab_sz)) + log_prob[i])\
                                           .view(-1)
-                "shape (4 bt,5 beam)"
+
+                # 2.2.2 We get the topk values in cumulative_hyp_scores_i and compute the current (generating) sentence
+                # and the next word using: ix // vocab_sz, ix % vocab_sz.
+                "shape (cur_beam_sz,)"
                 live_hyp_num_i = beam_size - len(completed_hypotheses[i])
-                "shape (4 bt, 5 beam_size). Vals are between 0 and 50002 vocab_sz * 1 dec_sent_len. Note that dec_sent_len may be >1 in some applications"
-                top_cand_hyp_scores, top_cand_hyp_pos = torch.topk(contiuating_hyp_scores_i, k=live_hyp_num_i)
-                "shape (4 bt, 5 beam_size). prev_hyp_ids vals are 0 <= val < beam_size. hyp_word_ids vals are 0 <= val < vocab_len"
+                "shape (cur_beam_sz,). Vals are between 0 and 50002 vocab_sz"
+                top_cand_hyp_scores, top_cand_hyp_pos = torch.topk(cumulative_hyp_scores_i, k=live_hyp_num_i)
+                "shape (cur_beam_sz,). prev_hyp_ids vals are 0 <= val < cur_beam_sz. hyp_word_ids vals are 0 <= val < vocab_len"
                 prev_hyp_ids, hyp_word_ids = top_cand_hyp_pos // len(self.vocab.tgt), top_cand_hyp_pos % len(self.vocab.tgt)
 
+                # 2.2.3 For each of the topk words, we append the new word to the current (generating) sentence
+                # We add this to new_hypotheses_i and add its corresponding total score to new_hyp_scores_i
                 new_hypotheses_i, new_hyp_scores_i = [],[] # Removed live_hyp_ids_i, which is used in the LSTM decoder to track live hypothesis ids
                 for prev_hyp_id, hyp_word_id, cand_new_hyp_score in zip(prev_hyp_ids, hyp_word_ids, top_cand_hyp_scores):
                     prev_hyp_id, hyp_word_id, cand_new_hyp_score = \
@@ -271,17 +303,25 @@ class TransfomerModel(nn.Module):
                         new_hypotheses_i.append(new_hyp_sent.unsqueeze(-1))
                         new_hyp_scores_i.append(cand_new_hyp_score)
 
+                # 2.2.4 We may find that the hypotheses_i for some example in the batch
+                # is empty - we have fully processed that example. We use None as a sentinel in this case.
+                # Above, the loops gracefully handle None examples.
                 if len(new_hypotheses_i) > 0:
                     hypotheses_i = torch.cat(new_hypotheses_i, dim=-1).transpose(0,-1)
                     hyp_scores_i = torch.tensor(new_hyp_scores_i, dtype=torch.float, device=self.device)
                 else:
-                    hypotheses_i = None
-                    hyp_scores_i = None
+                    hypotheses_i, hyp_scores_i = None, None
                 new_hypotheses += [hypotheses_i]
                 new_hyp_scores += [hyp_scores_i]
-            print(new_hypotheses, new_hyp_scores)
+            # print(new_hypotheses, new_hyp_scores)
             hypotheses, hyp_scores = new_hypotheses, new_hyp_scores
 
+        # 2.3 Finally, we do some postprocessing to get our final generated candidate sentences.
+        # Sometimes, we may get to max_len of a sentence and still not generate the </s> end token.
+        # In this case, the partial sentence we have generated will not be added to the completed_hypotheses
+        # automatically, and we have to manually add it in. We add in as many as necessary so that there are
+        # `beam_size` completed hypotheses for each example.
+        # Finally, we sort each completed hypothesis by score.
         for i in range(batch_size):
             hyps_to_add = beam_size - len(completed_hypotheses[i])
             if hyps_to_add > 0:
@@ -291,161 +331,5 @@ class TransfomerModel(nn.Module):
                     value=[self.vocab.tgt.id2word[a.item()] for a in hypotheses[i][id][1:]],
                     score=score))
             completed_hypotheses[i].sort(key=lambda hyp: hyp.score, reverse=True)
-        print('completed_hypotheses', completed_hypotheses)
-        return completed_hypotheses
-
-        #         # candidate_probs_all, candidate_ix_all = torch.topk(log_prob, beam_size, dim=1)
-        #         ys = torch.cat([ys, candidate_ix_all.unsqueeze(-1)], dim = -1)
-        #         continue
-        #     else:
-        #         # # INSERT CODE FOR ITERATIONS 2...
-        #         "shape (batch * beam, decoded_len_so_far)"
-        #         ys_orig = ys
-        #         # ys = ys.view(batch_size * beam_size, -1)
-        #         out = self.model.decode(model_encodings, src_mask, Variable(ys).to(self.device),
-        #                                 Variable(subsequent_mask(ys.size(-1)).type_as(src.data)).to(self.device))
-        #         # "log_prob is prob of this particular word given the previous. " \
-        #         # "Log_probs are supposed to be added. This produces the full conditional prob (log version)" \
-        #         # "of all the tokens starting from the first."
-        #         log_prob = self.model.generator(out[:,:,-1,:])
-        #         k_probs, k_next_word_ixs = torch.topk(log_prob, beam_size, dim=-1)
-        #         "shape (4 bt,5 beam, 5 beam)"
-        #         candidate_probs_all = k_probs + current_probs
-        #         "shape (4 bt, 25 beam * beam)"
-        #         candidate_probs_all = candidate_probs_all.view(-1, beam_size * beam_size)
-        #
-        #         topkprob_values, topkprob_ix = torch.topk(candidate_probs_all, 5, -1)
-        #
-        #         seq_len = ys.size(-1)
-        #
-        #         ix_in_lineage = torch.cat([(topkprob_ix // 5).unsqueeze(-1)] * seq_len, dim=-1)
-        #         ix_in_newtoken = torch.cat([(topkprob_ix // 5).unsqueeze(1), (topkprob_ix % 5).unsqueeze(1)], dim=1)
-        #         ixa=ix_in_newtoken
-        #         ixx = topkprob_ix // 5
-        #         ixy = topkprob_ix % 5
-        #
-        #         lineage = ys.gather(1, ix_in_lineage) # This works
-        #
-        #         k_next_word_ixs.gather(1,ix_in_newtoken) # TODO this doesnt work, fix
-        #
-        #         topkprob_ix // beam_size
-        #         topkprob_ix % beam_size
-        #         current_probs = topkprob_values.unsqueeze(1)
-        #         # currnet_lineage =
-        #
-        #         ys.gather(1,prior_lineage_ix)
-        #         # "shape (4 bt,5 beam)"
-        #         # ys = torch.cat([ys, next_word.unsqueeze(1).type_as(src.data)], dim=1)
-        #
-        #         # candidate_ix_all_old = candidate_ix_all
-        #         # candidate_ix_all = candidate_ix_all.view(-1, beam_size * beam_size)
-        #
-        #         # shape (4 bt, 5 beam)
-        #         prior_lineage_ix = topkprob_ix // beam_size #TODO UNTESTED
-        #         current_candidate_ix.gather(1,prior_lineage_ix) #TODO UNTESTED
-        #         # full_lineage += current_candidate_ix
-        #         ys = torch.cat([ys, current_candidate_ix.unsqueeze(1).type_as(src.data)], dim=1)
-        #         "shape (4 bt,5 beam)"
-        #         current_probs = candidate_probs_all.gather(1, topkprob_ix) # also = topkprob_values but whatever
-        #         "shape (4 bt,5 beam)"
-        #         current_candidate_ix = candidate_ix_all.gather(1, topkprob_ix)
-        #
-        #         "When you do this view you lose the dependency between the new token and the token it came from (dim -2)"
-        #         "You will be able to get the top 5 of the 25 tokens in terms of log_prob, but you also have to " \
-        #         "keep track of which of the previous dimensions (corresponding to previous tokens) it came from"
-        #
-        # return ys
-
-
-
-    def beam_search(self, src_sent: List[str], beam_size: int = 5, max_decoding_time_step: int = 70) -> List[
-        Hypothesis]:
-        """ Given a single source sentence, perform beam search, yielding translations in the target language.
-        @param src_sent (List[str]): a single source sentence (words)
-        @param beam_size (int): beam size
-        @param max_decoding_time_step (int): maximum number of time steps to unroll the decoding RNN
-        @returns hypotheses (List[Hypothesis]): a list of hypothesis, each hypothesis has two fields:
-                value: List[str]: the decoded target sentence, represented as a list of words
-                score: float: the log-likelihood of the target sentence
-        """
-        src_sents_var = self.vocab.src.to_input_tensor([src_sent], self.device)
-
-        src_encodings, dec_init_vec = self.encode(src_sents_var, [len(src_sent)]) #TODO
-        src_encodings_att_linear = self.att_projection(src_encodings)             #TODO
-
-        h_tm1 = dec_init_vec
-        att_tm1 = torch.zeros(1, self.hidden_size, device=self.device)            #TODO
-
-        eos_id = self.vocab.tgt['</s>']
-
-        hypotheses = [['<s>']]
-        hyp_scores = torch.zeros(len(hypotheses), dtype=torch.float, device=self.device)
-        completed_hypotheses = []
-
-        t = 0
-        while len(completed_hypotheses) < beam_size and t < max_decoding_time_step:
-            t += 1
-            hyp_num = len(hypotheses)
-
-            exp_src_encodings = src_encodings.expand(hyp_num,                     #TODO
-                                                     src_encodings.size(1),
-                                                     src_encodings.size(2))
-
-            exp_src_encodings_att_linear = src_encodings_att_linear.expand(hyp_num,
-                                                                           src_encodings_att_linear.size(1),
-                                                                           src_encodings_att_linear.size(2))
-
-            y_tm1 = torch.tensor([self.vocab.tgt[hyp[-1]] for hyp in hypotheses], dtype=torch.long, device=self.device)
-            y_t_embed = self.model_embeddings.target(y_tm1)
-
-            x = torch.cat([y_t_embed, att_tm1], dim=-1)
-
-            (h_t, cell_t), att_t, _ = self.step(x, h_tm1,                          #TODO
-                                                exp_src_encodings, exp_src_encodings_att_linear, enc_masks=None)
-
-            # log probabilities over target words
-            log_p_t = F.log_softmax(self.target_vocab_projection(att_t), dim=-1)
-
-            live_hyp_num = beam_size - len(completed_hypotheses)
-            contiuating_hyp_scores = (hyp_scores.unsqueeze(1).expand_as(log_p_t) + log_p_t).view(-1)
-            top_cand_hyp_scores, top_cand_hyp_pos = torch.topk(contiuating_hyp_scores, k=live_hyp_num)
-
-            prev_hyp_ids = top_cand_hyp_pos / len(self.vocab.tgt)
-            hyp_word_ids = top_cand_hyp_pos % len(self.vocab.tgt)
-
-            new_hypotheses = []
-            live_hyp_ids = []
-            new_hyp_scores = []
-
-            for prev_hyp_id, hyp_word_id, cand_new_hyp_score in zip(prev_hyp_ids, hyp_word_ids, top_cand_hyp_scores):
-                prev_hyp_id = prev_hyp_id.item()
-                hyp_word_id = hyp_word_id.item()
-                cand_new_hyp_score = cand_new_hyp_score.item()
-
-                hyp_word = self.vocab.tgt.id2word[hyp_word_id]
-                new_hyp_sent = hypotheses[prev_hyp_id] + [hyp_word]
-                if hyp_word == '</s>':
-                    completed_hypotheses.append(Hypothesis(value=new_hyp_sent[1:-1],
-                                                           score=cand_new_hyp_score))
-                else:
-                    new_hypotheses.append(new_hyp_sent)
-                    live_hyp_ids.append(prev_hyp_id)
-                    new_hyp_scores.append(cand_new_hyp_score)
-
-            if len(completed_hypotheses) == beam_size:
-                break
-
-            live_hyp_ids = torch.tensor(live_hyp_ids, dtype=torch.long, device=self.device)
-            h_tm1 = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
-            att_tm1 = att_t[live_hyp_ids]
-
-            hypotheses = new_hypotheses
-            hyp_scores = torch.tensor(new_hyp_scores, dtype=torch.float, device=self.device)
-
-        if len(completed_hypotheses) == 0:
-            completed_hypotheses.append(Hypothesis(value=hypotheses[0][1:],
-                                                   score=hyp_scores[0].item()))
-
-        completed_hypotheses.sort(key=lambda hyp: hyp.score, reverse=True)
-
+        # print('completed_hypotheses', completed_hypotheses)
         return completed_hypotheses
