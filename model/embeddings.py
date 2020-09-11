@@ -40,5 +40,6 @@ class PositionalEncoding(nn.Module):
         :param x: shape - (batch_size, sentence_len, d_model)
         :return: shape - (batch_size, sentence_len, d_model)
         """
-        x = x + Variable(self.pe[:, :x.size(-2), :], requires_grad=False)
+        x = x + Variable(self.pe[:, :x.size(1)],
+                         requires_grad=False)
         return self.dropout(x)

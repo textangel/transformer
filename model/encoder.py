@@ -1,7 +1,8 @@
 import torch.nn as nn
 from model.attention import MultiHeadedAttention
-from model.common import clones, LayerNorm, SublayerConnection, PositionwiseFeedForward
+from model.common import LayerNorm, SublayerConnection, PositionwiseFeedForward
 import torch
+import copy
 
 class EncoderLayer(nn.Module):
     "Encoder is made up of self-attn and feed forward"
@@ -15,7 +16,7 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.sublayer = nn.ModuleList([copy.deepcopy(SublayerConnection(size, dropout)) for _ in range(2)])  #clones
         self.size = size
 
     def forward(self, x, mask):
@@ -32,7 +33,7 @@ class Encoder(nn.Module):
     "Core Encoder is a stack of N layers"
     def __init__(self, layer: EncoderLayer, N: int):
         super(Encoder, self).__init__()
-        self.layers = clones(layer, N)
+        self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(N)])  #clones
         self.norm = LayerNorm(layer.size)
 
     def forward(self, x, mask):

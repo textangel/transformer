@@ -3,9 +3,9 @@ import torch.nn as nn
 import copy
 import torch.nn.functional as F
 
-def clones(module: nn.Module, N: int):
-    "Produce N identical layers."
-    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+# def clones(module: nn.Module, N: int):
+#     "Produce N identical layers."
+#     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)"

@@ -35,7 +35,6 @@ class NoamOpt:
                 min(step ** (-0.5), step * self.warmup ** (-1.5)))
 
 
-    # TODO UNTESTED
     def load(self, model_path: str):
         params = torch.load(model_path, map_location=lambda storage, loc: storage)
         args = params['args']

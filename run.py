@@ -42,6 +42,7 @@ Step 1:
 python vocab.py --train-src=./en_es_data/train.es --train-tgt=./en_es_data/train.en vocab.json --size=50000 --freq-cutoff=2
 1.2 You can then directly read in this vocab file using `vocab = Vocab.load(path)`
 """
+from functools import partial
 from collections import namedtuple
 from typing import Dict, List
 from docopt import docopt
@@ -59,6 +60,7 @@ from training.label_smooth import LabelSmoothing
 from vocab.vocab import text_to_tensor
 from vocab.vocab_preprocess import batch_iter, read_corpus
 
+#Probably tested
 def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: List[List[str]]) -> float:
     """ Given decoding results and reference sentences, compute corpus-level BLEU score.
     @param references (List[List[str]]): a list of gold-standard reference target sentences
@@ -89,7 +91,9 @@ class SimpleLossCompute:
         out_grad = []
         for i in range(out.size(1)):
             out_column = Variable(out[:, i].data, requires_grad=True)
+            "shape (batch_size, vocab_sz)"
             gen = self.generator(out_column)
+            "shape (batch_size, )"
             out_y = y[:, i].data
             loss = self.criterion(gen, out_y) / norm
             total += loss.item()
@@ -143,6 +147,31 @@ def train_step(model, batch_sents_data, vocab, loss_compute, device):
     loss = loss_compute(out, batch.trg_y, batch.ntokens)
     return loss, batch_size, batch.ntokens.cpu().numpy()
 
+def nllLoss(pad_token, y_pred, y):
+    """
+    y_pred (batch_size, vocab_sz) - is log softmax prob of outputs obtained by calling log_softmax on output embeddings.
+    y (batch_size, ) - is ground truth - the words actually used.
+    :return:
+    """
+    "shape (batch_size, 1) "
+    y_reshaped = y.unsqueeze(-1)
+    target_masks = (y_reshaped != pad_token).float()
+    target_gold_words_log_prob = torch.gather(y_pred, index=y_reshaped, dim=-1) * target_masks
+    loss = -1 * target_gold_words_log_prob.sum()
+    return loss
+
+def nllLoss(pad_token, y_pred, y):
+    """
+    y_pred (batch_size, vocab_sz) - is log softmax prob of outputs obtained by calling log_softmax on output embeddings.
+    y (batch_size, ) - is ground truth - the words actually used.
+    :return:
+    """
+    "shape (batch_size, 1) "
+    y_reshaped = y.unsqueeze(-1)
+    target_masks = (y_reshaped != pad_token).float()
+    target_gold_words_log_prob = torch.gather(y_pred, index=y_reshaped, dim=-1) * target_masks
+    loss = -1 * target_gold_words_log_prob.sum()
+    return loss
 
 def train(args: Dict):
     """ Train the NMT Model.
@@ -158,10 +187,13 @@ def train(args: Dict):
     transformer_model = TransfomerModel(vocab, N, d_model, d_ff, h, dropout, device)
     model = transformer_model.model
     optimizer = NoamOpt(model.src_embed[0].d_model, 1, 400,
-                        torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9))
+                        torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-9))
 
     # criterion = nn.CrossEntropyLoss()
-    criterion = LabelSmoothing(size=len(vocab.tgt.word2id), padding_idx=vocab.tgt.word2id['<pad>'], smoothing=0.0)
+    # criterion = LabelSmoothing(size=len(vocab.tgt.word2id), padding_idx=vocab.tgt.word2id['<pad>'], smoothing=0.0)
+    criterion = LabelSmoothing(size=len(vocab.tgt.word2id), padding_idx=vocab.tgt.word2id['<pad>'],
+                               smoothing=0.001)
+    # criterion = partial(nllLoss, vocab.src.word2id['<pad>'])
     loss_compute_train = SimpleLossCompute(model.generator, criterion, optimizer)
     loss_compute_dev = SimpleLossCompute(model.generator, criterion, optimizer, train=False)
 
@@ -188,13 +220,13 @@ def train(args: Dict):
                 elapsed_since_last = time.time() - train_time
                 print(f"epoch {epoch}, iter {train_iter}, avg loss {report_loss / report_examples: .3f}, "
                       f"avg ppl {np.exp(report_loss / report_tgt_words): .3f}, cum examples {cum_exmaples}, "
-                      f"speed {report_tgt_words/ elapsed_since_last: .3f} w/s, elapsed time {elapsed: .3f} s")
+                      f"speed {report_tgt_words/ elapsed_since_last: .3f} w/s, elapsed time {elapsed: .3f} s, lr= {optimizer._rate}")
                 train_time = time.time()
                 report_tgt_words = report_loss = report_examples = 0.
 
             if train_iter % valid_niter == 0:
                 print(f"epoch {epoch}, iter {train_iter}, cum. loss {cum_loss/cum_exmaples}, "
-                      f"cum ppl {np.exp(cum_loss / cum_tgt_words)}, cum exmples {cum_exmaples}")
+                      f"cum ppl {np.exp(cum_loss / cum_tgt_words)}, cum exmples {cum_exmaples}, lr= {optimizer._rate}")
                 cum_loss = cum_exmaples = cum_tgt_words = 0.
                 valid_num += 1
                 print("begin validation ...")
@@ -246,8 +278,7 @@ def decode(args: Dict[str, str], max_batch_size=512, mode='greedy'):
             hypotheses_i = [[transformer_model.vocab.tgt.id2word[w] for w in sent] for sent in hypotheses_i]
             hypotheses += hypotheses_i[0].value
         elif mode == 'beam':
-            q
-            quit(q)beam_size = int(args.get('--beam_size', 8))
+            beam_size = int(args.get('--beam_size', 8))
             hypotheses_batch = transformer_model.beam_search_decode(tensor_src_i, beam_size=beam_size)
             hypotheses += [hyp_i[0].value for hyp_i in hypotheses_batch]
         print(f"Decoded batches {i} - {i+bs}: {num_examples - i - bs} more to go!")
@@ -281,7 +312,7 @@ def main():
     if args['train']:
         train(args)
     elif args['decode']:
-        decode(args,mode='beam')
+        decode(args,mode='greedy')
     else:
         raise RuntimeError('invalid run mode')
 

@@ -12,9 +12,11 @@ from torch.autograd import Variable
 
 class LabelSmoothing(nn.Module):
     "Implement Label Smoothing"
-    def __init__(self, size, padding_idx, smoothing=0.0):
+    def __init__(self, size, padding_idx, smoothing=0.0, criterion=None):
         super(LabelSmoothing, self).__init__()
-        self.criterion = nn.KLDivLoss(size_average=False)
+        if criterion is None:
+            criterion = nn.KLDivLoss(size_average=False)
+        self.criterion = criterion
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing

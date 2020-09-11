@@ -1,6 +1,7 @@
 import torch.nn as nn
 from model.attention import MultiHeadedAttention
-from model.common import clones, LayerNorm, SublayerConnection, PositionwiseFeedForward
+from model.common import LayerNorm, SublayerConnection, PositionwiseFeedForward
+import copy
 
 class DecoderLayer(nn.Module):
     "Decoder is made up of self-attn, src-attn, and feed-froward"
@@ -15,7 +16,7 @@ class DecoderLayer(nn.Module):
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+        self.sublayer = nn.ModuleList([copy.deepcopy(SublayerConnection(size, dropout)) for _ in range(3)])  #clones
 
     def forward(self, x, memory, src_mask, tgt_mask):
         """
@@ -36,7 +37,7 @@ class Decoder(nn.Module):
     "Generic N layer decoder with masking"
     def __init__(self, layer: DecoderLayer, N: int):
         super(Decoder, self).__init__()
-        self.layers = clones(layer, N)
+        self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(N)])  #clones
         self.norm = LayerNorm(layer.size)
 
     def forward(self, x, memory, src_mask, tgt_mask):

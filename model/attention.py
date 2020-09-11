@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math, copy
-from .common import clones
 
 # Attention
 ## An attention function can be described as mapping a query and a set of key-value pairs to an output,
@@ -89,7 +88,7 @@ class MultiHeadedAttention(nn.Module):
         # We assume here that d_v always equals d_k
         self.d_k = d_model // h
         self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.linears = nn.ModuleList([copy.deepcopy(nn.Linear(d_model, d_model)) for _ in range(4)]) #clones
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
@@ -103,15 +102,10 @@ class MultiHeadedAttention(nn.Module):
 
         assumes key == value
         """
-        batch_size = query.size(0)
-        if len(query.shape) == 3: query = query.unsqueeze(1)
-        if len(key.shape) == 3: key = key.unsqueeze(1)
-        if len(value.shape) == 3: value = value.unsqueeze(1)
-
         if mask is not None:
-            # Same mask applied to all h heads
-            mask = mask.unsqueeze(1).unsqueeze(1)
-
+            # Same mask applied to all h heads.
+            mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
 
         # 1) Do all the linear projections in batch from d_model => d x d_k
         # Note: view instantiates a tensor view
@@ -120,12 +114,13 @@ class MultiHeadedAttention(nn.Module):
         "l(x) does not change the shape. The view and transpose transforms the (batch_size, sentence_len, d_model)" \
         "tensor into shape (batch_size, h, sentence_len, d_k)"
         query, key, value = \
-            [l(x).view(batch_size, x.shape[1], -1, self.h, self.d_k).transpose(-2,-3)
+            [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
              for l, x in zip(self.linears, (query, key, value))]
 
         # 2) Apply attention on all the projected vectors in batch
         "x has shape (batch_size, h, sent_len, d_k)"
-        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
+        x, self.attn = attention(query, key, value, mask=mask,
+                                 dropout=self.dropout)
 
         # 3) "Concat" using a view and apply a final linear
         # The below code essentially cuts up each l(x) into h groups of dim d_k each,
@@ -136,9 +131,6 @@ class MultiHeadedAttention(nn.Module):
         # And as for contiguous(..), it’s typically called because most cases view(...)
         # would throw an error if contiguous(..) isn’t called before.
         "x has shape (batch_size, h, sent_len, d_k) and is reshaped into shape (batch_size, sent_len, d_model) "
-        x = x.transpose(-2, -3).contiguous() \
-            .view(batch_size, x.shape[1], -1, self.h * self.d_k)
-
-        if x.shape[1] == 1: x = x.squeeze(1)
-        "return shape: (batch_size, sent_len, d_model)"
+        x = x.transpose(1, 2).contiguous() \
+            .view(nbatches, -1, self.h * self.d_k)
         return self.linears[-1](x)
