@@ -79,7 +79,7 @@ class SimpleLossCompute:
     """
     A simple loss compute and train function. We decode the output text one char position at a time.
     """
-    def __init__(self, generator: Generator, criterion, optimizer=None, train=True):
+    def __init__(self, generator: Generator, criterion, optimizer, train=True):
         self.generator = generator
         self.criterion = criterion
         self.optimizer = optimizer
@@ -87,30 +87,30 @@ class SimpleLossCompute:
 
     # Here we generate the output text one column (word) at a time
     def __call__(self, out, y, norm):
-        total = 0.0
         out_grad = []
+        total_loss = 0
         for i in range(out.size(1)):
             out_column = Variable(out[:, i].data, requires_grad=True)
             "shape (batch_size, vocab_sz)"
-            gen = self.generator(out_column)
+            y_pred = self.generator(out_column)
             "shape (batch_size, )"
-            out_y = y[:, i].data
-            loss = self.criterion(gen, out_y) / norm
-            total += loss.item()
+            y_actual = y[:, i].data
+            loss = self.criterion(y_pred, y_actual) / norm
+            total_loss += float(loss.cpu().data.item())
             if self.training:
                 loss.backward()
                 out_grad.append(out_column.grad.data.clone())
+        
         if self.training:
             out_grad = torch.stack(out_grad, dim=1)
             out.backward(gradient=out_grad)
 
-        if self.optimizer is not None:
-            self.optimizer.step()
-            self.optimizer.optimizer.zero_grad()
-            # Note: Since the backward() function accumulates gradients, and you don’t want to mix up gradients between minibatches,
-            # you have to zero them out at the start of a new minibatch. This is exactly like how a general (additive) accumulator
-            # variable is initialized to 0 in code.
-        return total
+        self.optimizer.step()
+        self.optimizer.optimizer.zero_grad()
+        # Note: Since the backward() function accumulates gradients, and you don’t want to mix up gradients between minibatches,
+        # you have to zero them out at the start of a new minibatch. This is exactly like how a general (additive) accumulator
+        # variable is initialized to 0 in code.
+        return total_loss * norm
 
 
 def run_dev_session(model, dev_data, vocab, loss_compute, batch_size=32, device=torch.device('cpu')):
@@ -122,43 +122,33 @@ def run_dev_session(model, dev_data, vocab, loss_compute, batch_size=32, device=
     """
     was_training = model.training
     model.eval()
-    cum_loss = cum_tgt_words = 0.
+    cum_loss = cum_tgt_words = cum_examples = 0.
 
     # no_grad() signals backend to throw away all gradients
     with torch.no_grad():
-        for train_iter, batch_dev_sents in enumerate(batch_iter(dev_data, batch_size=batch_size)):
-            loss, batch_size, ntokens = train_step(model, batch_dev_sents, vocab, loss_compute, device=device)
-            cum_loss += loss
-            cum_tgt_words += ntokens
-        ppl = np.exp(cum_loss / cum_tgt_words)
-
+      for train_iter, batch_dev_sents in enumerate(batch_iter(dev_data, batch_size=batch_size)):
+          loss, batch_size, ntokens = train_step(model, batch_dev_sents, vocab, loss_compute, device=device)
+          cum_loss += loss
+          cum_examples += batch_size
+          cum_tgt_words += ntokens
+      dev_loss = cum_loss / cum_examples
+      ppl = np.exp(cum_loss / cum_tgt_words)
+      
     if was_training:
         model.train()
 
-    return cum_loss, ppl
+    return dev_loss, ppl
 
 def train_step(model, batch_sents_data, vocab, loss_compute, device):
+    # Tested
     src_sents, tgt_sents = batch_sents_data
     batch_size = len(src_sents)
-
     tensor_src, tensor_tgt = text_to_tensor(src_sents, tgt_sents, vocab, device)
+
     batch = Batch(tensor_src.transpose(0,1), tensor_tgt.transpose(0,1), vocab.tgt.word2id['<pad>'])
     out = model.forward(batch.src, batch.trg, batch.src_mask, batch.trg_mask)
     loss = loss_compute(out, batch.trg_y, batch.ntokens)
-    return loss, batch_size, batch.ntokens.cpu().numpy()
-
-def nllLoss(pad_token, y_pred, y):
-    """
-    y_pred (batch_size, vocab_sz) - is log softmax prob of outputs obtained by calling log_softmax on output embeddings.
-    y (batch_size, ) - is ground truth - the words actually used.
-    :return:
-    """
-    "shape (batch_size, 1) "
-    y_reshaped = y.unsqueeze(-1)
-    target_masks = (y_reshaped != pad_token).float()
-    target_gold_words_log_prob = torch.gather(y_pred, index=y_reshaped, dim=-1) * target_masks
-    loss = -1 * target_gold_words_log_prob.sum()
-    return loss
+    return loss.cpu(), batch_size, batch.ntokens.cpu().numpy()
 
 def nllLoss(pad_token, y_pred, y):
     """
@@ -276,7 +266,7 @@ def decode(args: Dict[str, str], max_batch_size=512, mode='greedy'):
             hypotheses_i = transformer_model.greedy_decode(tensor_src_i)
             hypotheses_i = hypotheses_i.cpu().detach().numpy()
             hypotheses_i = [[transformer_model.vocab.tgt.id2word[w] for w in sent] for sent in hypotheses_i]
-            hypotheses += hypotheses_i[0].value
+            hypotheses += hypotheses_i
         elif mode == 'beam':
             beam_size = int(args.get('--beam_size', 8))
             hypotheses_batch = transformer_model.beam_search_decode(tensor_src_i, beam_size=beam_size)
